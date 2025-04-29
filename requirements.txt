@@ -1,2 +1,5 @@
 flask
+requests
 numpy
+torch
+transformers
