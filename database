@@ -1,0 +1,279 @@
+# build_full_database_deeplink_docfilter_enhanced.py
+# Script om een database te vullen met alle uitspraken voor een specifiek
+# rechtsgebied via de Rechtspraak Open Data API index met paginering.
+# Filtert initieel op ECLI's die een document hebben ('return=DOC').
+# Gebruikt ALTIJD de deeplink als opgeslagen link.
+# Extracteert nu ook de volledige uitspraaktekst en meer metadata.
+import feedparser
+import requests
+import sqlite3
+import numpy as np
+import re
+import time
+import os
+import xml.etree.ElementTree as ET
+from lxml import etree
+try:
+    from bert_loader import load_legalbert_embedding_pipeline
+except ImportError:
+    print("FATAL ERROR: bert_loader.py niet gevonden. Script kan niet draaien.")
+    exit()
+# --- Configuratie ---
+API_INDEX_URL         = "https://data.rechtspraak.nl/uitspraken/zoeken"
+API_DOCUMENT_URL      = "https://data.rechtspraak.nl/uitspraken/content"
+RECHTSGEBIED_URI      = "http://psi.rechtspraak.nl/rechtsgebied#bestuursrecht_omgevingsrecht"
+DB_PATH               = "omgevingsrecht_jurisprudentie_published_enhanced.db" # Nieuwe databasenaam
+MAX_RESULTS_PER_PAGE  = 1000
+MAX_ECLI_TO_PROCESS   = None
+MAX_TEXT_LENGTH_FOR_EMBEDDING = 1024
+REQUEST_DELAY         = 1
+API_TIMEOUT           = 45
+MAX_RETRIES_API       = 3
+# --- Functies ---
+def extract_ecli_from_text(text):
+    if not text: return None
+    match = re.search(r'ECLI:NL:[A-Z0-9:]+:\d{4}:[A-Z0-9.]+', text, re.IGNORECASE)
+    if match:
+        return match.group(0).upper()
+    return None
+def setup_database(db_path):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS uitspraken (
+            ecli TEXT PRIMARY KEY,
+            titel TEXT,
+            samenvatting TEXT,
+            link TEXT,
+            embedding BLOB,
+            volledige_tekst TEXT,
+            datum_publicatie TEXT,
+            type_procedure TEXT,
+            instantie TEXT,
+            type_uitspraak TEXT
+        )
+    ''')
+    conn.commit()
+    print(f"Database {db_path} klaar voor gebruik (met extra kolommen).")
+    return conn, cursor
+def check_ecli_exists(cursor, ecli):
+    cursor.execute("SELECT 1 FROM uitspraken WHERE ecli = ?", (ecli,))
+    return cursor.fetchone() is not None
+
+def extract_text_from_node_alternative(node):
+    """Alternatieve methode om tekst te extraheren."""
+    return "".join(node.itertext()).strip()
+def extract_full_text_from_xml_debug(root, namespaces):
+    """Debug versie van extract_full_text_from_xml."""
+    uitspraak_element = root.find('.//rs:uitspraak', namespaces)
+    if uitspraak_element is not None:
+        tekst_delen = []
+        for element in uitspraak_element.xpath('//*[self::para or self::parablock]'):
+            tekst_delen.append(extract_text_from_node_alternative(element))
+        return "\n\n".join(tekst_delen).strip()
+    return extract_text_from_node_alternative(root).strip()
+def extract_metadata_from_xml(root, namespaces):
+    """Extraheert extra metadata uit de XML."""
+    metadata = {}
+    issued_el = root.find('.//dcterms:issued', namespaces)
+    metadata['datum_publicatie'] = issued_el.text if issued_el is not None else None
+    procedure_el = root.find('.//psi:procedure', namespaces)
+    metadata['type_procedure'] = procedure_el.text if procedure_el is not None else None
+    instantie_el = root.find('.//psi:instantie', namespaces)
+    metadata['instantie'] = extract_text_from_node(instantie_el) if instantie_el is not None else None
+    type_el = root.find('.//psi:type', namespaces)
+    metadata['type_uitspraak'] = type_el.text if type_el is not None else None
+    return metadata
+# --- Hoofd Script ---
+if __name__ == "__main__":
+    print("--- Start Script: Volledige Database Bouwen via API Index (Filter: DOC, met Deeplinks & Enhanced Data) ---")
+    # 1. Laad het embedding model
+    print("🚀 Initialiseren Legal BERT embedding model...")
+    try:
+        get_embedding_function = load_legalbert_embedding_pipeline()
+        if get_embedding_function is None: raise ValueError("Loader gaf None terug")
+        print("✅ Model geladen.")
+    except Exception as e:
+        print(f"❌ Fout bij laden model: {e}. Script gestopt.")
+        exit()
+    # 2. Zet de database op
+    print(f"\nDatabase openen/aanmaken op: {DB_PATH}")
+    try:
+        conn, cursor = setup_database(DB_PATH)
+    except Exception as e:
+        print(f"❌ Fout bij opzetten database: {e}. Script gestopt.")
+        exit()
+    # 3. Haal ALLE ECLI's op voor het rechtsgebied via paginering, met 'return=DOC' filter
+    print(f"\nECLI's ophalen voor rechtsgebied: {RECHTSGEBIED_URI} (alleen met document)...")
+    all_eclis = set()
+    from_index = 0
+    total_retrieved_on_page = MAX_RESULTS_PER_PAGE
+    while total_retrieved_on_page >= MAX_RESULTS_PER_PAGE:
+        print(f"  Paginering: Index {from_index} ophalen (max {MAX_RESULTS_PER_PAGE}, return=DOC)...")
+        params = {
+            'subject': RECHTSGEBIED_URI,
+            'max': MAX_RESULTS_PER_PAGE,
+            'from': from_index,
+            'return': 'DOC'
+        }
+        try:
+            time.sleep(REQUEST_DELAY)
+            index_resp = requests.get(API_INDEX_URL, params=params, timeout=API_TIMEOUT)
+            index_resp.raise_for_status()
+            feed = feedparser.parse(index_resp.content)
+            if feed.bozo:
+                print(f"  ⚠️ Waarschuwing/Fout bij parsen index response: {feed.bozo_exception}")
+            page_eclis = set()
+            if feed and feed.entries:
+                for entry in feed.entries:
+                    ecli = entry.get('id')
+                    if ecli and ecli.upper().startswith("ECLI:NL:"):
+                        page_eclis.add(ecli.upper())
+                total_retrieved_on_page = len(page_eclis)
+            else:
+                total_retrieved_on_page = 0
+            all_eclis.update(page_eclis)
+            print(f"  {total_retrieved_on_page} ECLI's gevonden op deze pagina. Totaal uniek nu: {len(all_eclis)}")
+            if MAX_ECLI_TO_PROCESS is not None and len(all_eclis) >= MAX_ECLI_TO_PROCESS:
+                print(f"\nℹ️ Maximum aantal te processen ECLI's ({MAX_ECLI_TO_PROCESS}) bereikt.")
+                all_eclis = set(list(all_eclis)[:MAX_ECLI_TO_PROCESS])
+                break
+            from_index += total_retrieved_on_page
+            if total_retrieved_on_page < MAX_RESULTS_PER_PAGE:
+                print("  Laatste pagina bereikt of geen resultaten meer.")
+                break
+        except requests.exceptions.RequestException as e_idx:
+            print(f"❌ Fout tijdens index API call naar {e_idx.request.url if e_idx.request else API_INDEX_URL} (vanaf {from_index}): {e_idx}")
+            if hasattr(e_idx, 'response') and e_idx.response is not None:
+                print(f"   Response Status: {e_idx.response.status_code}")
+                print(f"   Response Text: {e_idx.response.text[:500]}...")
+            print("  Stoppen met ophalen.")
+            break
+        except Exception as e_parse:
+            print(f"❌ Fout bij parsen index response (vanaf {from_index}): {e_parse}. Stoppen met ophalen.")
+            break
+    print(f"\n✅ Totaal {len(all_eclis)} unieke ECLI's (met document) verzameld voor verwerking.")
+    # 4. Verwerk elke verzamelde ECLI
+    entries_processed = 0
+    new_entries_added = 0
+    entries_failed = 0
+    entries_skipped_existing = 0
+    total_to_process = len(all_eclis)
+    if total_to_process == 0:
+        print("\nGeen ECLI's gevonden om te verwerken (met return=DOC filter).")
+    else:
+        print(f"\nℹ️ Start verwerking van {total_to_process} ECLI's...")
+        sorted_eclis = sorted(list(all_eclis))
+        for ecli in sorted_eclis:
+            entries_processed += 1
+            print(f"\n--- Verwerken ECLI {entries_processed}/{total_to_process}: {ecli} ---")
+            if check_ecli_exists(cursor, ecli):
+                print(f"ℹ️ ECLI {ecli} bestaat al in de database. Overgeslagen.")
+                entries_skipped_existing += 1
+                continue
+            # Haal volledige data op via API (met retries en XML parsing)
+            print(f"⏳ Details ophalen voor {ecli} via API...")
+            extracted_doc_data = None
+            for attempt in range(MAX_RETRIES_API):
+                doc_data_extracted_attempt = None
+                try:
+                    current_delay = REQUEST_DELAY * (attempt + 1)
+                    print(f"  Poging {attempt + 1}/{MAX_RETRIES_API} (delay: {current_delay}s)...")
+                    time.sleep(current_delay)
+                    doc_resp = requests.get(f"{API_DOCUMENT_URL}?id={ecli}", timeout=API_TIMEOUT)
+                    if doc_resp.status_code == 200:
+                        try:
+                            xml_text = doc_resp.text
+                            if not xml_text:
+                                print(f"  ⚠️ Poging {attempt + 1}: Lege response body ontvangen.")
+                                continue
+                            root = etree.fromstring(doc_resp.content)
+                            namespaces = {
+                                'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+                                'dcterms': 'http://purl.org/dc/terms/',
+                                'psi': 'http://psi.rechtspraak.nl/',
+                                'rs': 'http://www.rechtspraak.nl/schema/rechtspraak-1.0',
+                                'ecli': 'https://e-justice.europa.eu/ecli'
+                            }
+                            titel_el = root.find('.//dcterms:title', namespaces)
+                            titel_api = titel_el.text if titel_el is not None else f'Titel voor {ecli} N/A'
+                            link_to_store = f"https://deeplink.rechtspraak.nl/uitspraak?id={ecli}"
+                            volledige_tekst = extract_full_text_from_xml(root, namespaces)
+                            metadata = extract_metadata_from_xml(root, namespaces)
+                            text_to_embed = volledige_tekst[:MAX_TEXT_LENGTH_FOR_EMBEDDING] if volledige_tekst else titel_api[:MAX_TEXT_LENGTH_FOR_EMBEDDING]
+                            summary_to_store = volledige_tekst[:500] + ("..." if len(volledige_tekst) > 500 else "") if volledige_tekst else titel_api
+                            doc_data_extracted_attempt = {
+                                "titel": titel_api,
+                                "link": link_to_store,
+                                "text_to_embed": text_to_embed,
+                                "summary_to_store": summary_to_store,
+                                "volledige_tekst": volledige_tekst,
+                                "datum_publicatie": metadata.get('datum_publicatie'),
+                                "type_procedure": metadata.get('type_procedure'),
+                                "instantie": metadata.get('instantie'),
+                                "type_uitspraak": metadata.get('type_uitspraak')
+                            }
+                            print(f"  ✅ XML succesvol geparsed en data geëxtraheerd op poging {attempt + 1}.")
+                            break
+                        except ET.ParseError as e_parse:
+                            print(f"  ❌ Fout bij parsen XML voor {ecli} op poging {attempt + 1}: {e_parse}")
+                            print(f"    Ontvangen tekst (start): {doc_resp.text[:500]}...")
+                            if attempt == MAX_RETRIES_API - 1: print(f"❌ Definitief mislukt (XML parse error) voor {ecli}.")
+                        except Exception as e_extract:
+                            print(f"  ❌ Fout bij extraheren data uit XML voor {ecli} op poging {attempt + 1}: {e_extract}")
+                            if attempt == MAX_RETRIES_API - 1: print(f"❌ Definitief mislukt (XML extract error) voor {ecli}.")
+                    else:
+                        print(f"  ⚠️ Poging {attempt + 1} API request mislukt: Status code {doc_resp.status_code} - {doc_resp.reason}")
+                        try: print(f"    Response body (fout): {doc_resp.text[:500]}...")
+                        except Exception: pass
+                        if attempt == MAX_RETRIES_API - 1: print(f"❌ Definitief mislukt (HTTP status) voor {ecli} na {MAX_RETRIES_API} pogingen.")
+                except requests.exceptions.RequestException as e_req:
+                    print(f"  ⚠️ Poging {attempt + 1} API request (verbinding) mislukt: {e_req}")
+                    if attempt == MAX_RETRIES_API - 1: print(f"❌ Definitief mislukt (verbinding) voor {ecli} na {MAX_RETRIES_API} pogingen.")
+                except Exception as e_gen:
+                    print(f"❌ Onverwachte fout bij poging {attempt + 1} voor {ecli}: {e_gen}")
+                    if attempt == MAX_RETRIES_API - 1: print(f"❌ Skipping {ecli} door onverwachte fout.")
+            if doc_data_extracted_attempt is None:
+                entries_failed += 1
+                continue
+            titel_api = doc_data_extracted_attempt["titel"]
+            link_to_store = doc_data_extracted_attempt["link"]
+            text_to_embed = doc_data_extracted_attempt["text_to_embed"]
+            summary_to_store = doc_data_extracted_attempt["summary_to_store"]
+            volledige_tekst = doc_data_extracted_attempt["volledige_tekst"]
+            datum_publicatie = doc_data_extracted_attempt["datum_publicatie"]
+            type_procedure = doc_data_extracted_attempt["type_procedure"]
+            instantie = doc_data_extracted_attempt["instantie"]
+            type_uitspraak = doc_data_extracted_attempt["type_uitspraak"]
+            # Genereer de embedding
+            embedding_list = None
+            embedding_bytes = None
+            try:
+                if get_embedding_function and text_to_embed:
+                    embedding_list = get_embedding_function(text_to_embed)
+                    embedding_bytes = np.array(embedding_list, dtype=np.float32).tobytes()
+                else:
+                    print(f"  ⚠️ Kon geen embedding genereren voor {ecli}.")
+            except Exception as e_embed:
+                print(f"  ❌ Fout bij genereren embedding voor {ecli}: {e_embed}")
+            embedding = embedding_bytes # Gebruik de byte-representatie voor de database
+            # Voeg de data toe aan de database
+            try:
+                cursor.execute('''
+                    INSERT INTO uitspraken (ecli, titel, samenvatting, link, embedding, volledige_tekst, datum_publicatie, type_procedure, instantie, type_uitspraak)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (ecli, titel_api, summary_to_store, link_to_store, embedding, volledige_tekst, datum_publicatie, type_procedure, instantie, type_uitspraak))
+                conn.commit()
+                new_entries_added += 1
+                print(f"  ✅ Data succesvol toegevoegd aan database.")
+            except sqlite3.Error as e_db:
+                print(f"  ❌ Fout bij toevoegen data aan database voor {ecli}: {e_db}")
+    # 5. Afronding
+    print("\n--- Verwerking Afgerond ---")
+    print(f"Totaal aantal ECLI's geprobeerd te verwerken: {total_to_process}")
+    print(f"Nieuwe uitspraken toegevoegd aan de database: {new_entries_added}")
+    print(f"Uitspraken overgeslagen (bestonden al): {entries_skipped_existing}")
+    print(f"Verwerking van uitspraken mislukt: {entries_failed}")
+    if conn:
+        conn.close()
+        print("Databaseverbinding gesloten.")
